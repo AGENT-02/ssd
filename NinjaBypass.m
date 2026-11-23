@@ -1,6 +1,13 @@
 // ---------------------------------------------------------------------------
 // NinjaBypass — self-contained license bypass for NinjaGate-protected apps
-// (8 Ball Pool 56.x+). No substrate/Logos required at link time.
+// (8 Ball Pool 56.34.0 / com.ninja.engine.ios). No substrate/Logos at link time.
+//
+// Verified against the real binary:
+//   __DATA+0x110  uint8_t _gLicensed   (hint scores 11/13)
+//   __DATA+0x118  double  _gLicenseExpiry
+//   __DATA+0x120  double  _gNextValidation
+//   __TEXT+0x8034 _njBootstrap  stp x28,x30,[sp,#-0x40]!
+//   __TEXT+0xad74 _njCheck      stp x28,x30,[sp,#-0x40]!
 //
 // Load path for injected builds:
 //   LC_LOAD_DYLIB @executable_path/Frameworks/libNinjaBypass.dylib
@@ -23,17 +30,23 @@
 
 #define NJ_DEBUG 1
 
-// Layout inside __DATA: uint8_t _gLicensed; (7 pad); double _gLicenseExpiry;
-// double _gNextValidation. Deltas are fixed; the base is discovered.
+// Layout inside __DATA. Deltas are fixed; the base is discovered and validated.
 #define NJ_D_LICENSED 0
 #define NJ_D_EXPIRY   8
 #define NJ_D_NEXT     16
 
-// __TEXT hints (validated before use)
+// __TEXT hints, validated against the instruction at the target before hooking.
 #define NJ_OFF_BOOTSTRAP 0x8034
 #define NJ_OFF_CHECK     0xad74
 
 #define NJ_FAR_SECONDS 315360000.0   // +10 years
+
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+
+// Forward declarations: njScanClasses references these before their definitions.
+static void njGateWillAppear(id self, SEL sel, BOOL animated);
+static void njGateDidAppear(id self, SEL sel, BOOL animated);
+static void njTryLeaveGate(UIViewController *vc, int attempt);
 
 static uint8_t  *gState = NULL;      // points at _gLicensed
 static BOOL      gPatched = NO;
@@ -142,7 +155,7 @@ static NSInteger njScore(const uint8_t *seg, size_t i) {
 static uint8_t *njFindState(uint8_t *seg, size_t size, size_t hint) {
     if (!seg || size < 0x200) return NULL;
 
-    // Try the known hint first.
+    // Known-good hint first. Verified score on 56.34.0 is 11.
     if (hint + 24 < size && njScore(seg, hint) >= 8) {
         njLog(@"state found at hint +0x%zx", hint);
         return seg + hint;
@@ -173,15 +186,15 @@ static void njWriteLicense(void) {
     double far = (double)time(NULL) + NJ_FAR_SECONDS;
     NSString *body = [NSString stringWithFormat:@"OK %llu", (uint64_t)(far * 1000.0)];
     NSString *home = NSHomeDirectory();
-
-    NSArray *rels = @[ @"Documents/ninja_license.txt",
-                       @"Documents/ninjagate_license.txt",
-                       @"Documents/ng_license.txt",
-                       @"Documents/license.txt",
-                       @"Library/Application Support/ninja_license.txt",
-                       @"Library/Application Support/NinjaGate/license.txt" ];
-
     NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Names confirmed from strings in the framework.
+    NSArray *rels = @[ @"Documents/ninja_license.txt",
+                       @"Documents/ninja_console_v3_license.txt",
+                       @"Documents/hulk_console_v2_license.txt",
+                       @"Documents/ninjagate_license.txt",
+                       @"Library/Application Support/ninja_license.txt" ];
+
     for (NSString *rel in rels) {
         NSString *path = [home stringByAppendingPathComponent:rel];
         [fm createDirectoryAtPath:[path stringByDeletingLastPathComponent]
@@ -189,6 +202,14 @@ static void njWriteLicense(void) {
         NSError *err = nil;
         if (![body writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err])
             njLog(@"write failed %@: %@", rel, err.localizedDescription);
+    }
+
+    // Device fingerprint: only seed it if the gate has never made one.
+    NSString *dev = [home stringByAppendingPathComponent:@"Documents/ninja_device.txt"];
+    if (![fm fileExistsAtPath:dev]) {
+        [[[NSUUID UUID] UUIDString] writeToFile:dev atomically:YES
+                                       encoding:NSUTF8StringEncoding error:NULL];
+        njLog(@"seeded ninja_device.txt");
     }
     njLog(@"license files written");
 }
@@ -220,9 +241,9 @@ static BOOL njBootstrapHook(void *ctx) {
     njLog(@"bootstrap hook");
     njWriteLicense();
     njForce();
-    BOOL r = orig_bootstrap ? NJ_CALL(orig_bootstrap)(ctx) : YES;
+    if (orig_bootstrap) NJ_CALL(orig_bootstrap)(ctx);
     njForce();
-    return r ? YES : YES;
+    return YES;
 }
 
 static BOOL njCheckHook(void *ctx) {
@@ -233,10 +254,10 @@ static BOOL njCheckHook(void *ctx) {
     return YES;
 }
 
+// STP pre-index 64-bit keeps bits 31..22 fixed at 0xA98; imm7 occupies 21..15.
 static BOOL njPlausiblePrologue(uint32_t insn) {
     return insn == 0xD503233F                      // pacibsp
-        || (insn & 0xFFE00000) == 0xA9800000       // stp x29,x30 pre-index
-        || (insn & 0xFFE00000) == 0xA9000000;      // stp offset
+        || (insn & 0xFFC00000) == 0xA9800000;      // stp xN,xZ,[sp,#-imm]!
 }
 
 static void njHookText(const struct mach_header_64 *mh) {
@@ -289,10 +310,10 @@ static BOOL njRelevantSel(const char *s) {
     return NO;
 }
 
-static BOOL njYes0(id self, SEL _c)                          { return YES; }
-static BOOL njYes1(id self, SEL _c, id a)                    { return YES; }
-static BOOL njYes2(id self, SEL _c, id a, id b)              { return YES; }
-static BOOL njYes3(id self, SEL _c, id a, id b, id c)        { return YES; }
+static BOOL njYes0(id self, SEL _c)                     { return YES; }
+static BOOL njYes1(id self, SEL _c, id a)               { return YES; }
+static BOOL njYes2(id self, SEL _c, id a, id b)         { return YES; }
+static BOOL njYes3(id self, SEL _c, id a, id b, id c)   { return YES; }
 
 static void njSwizzle(Class cls, SEL sel, IMP rep) {
     Method m = class_getInstanceMethod(cls, sel);
@@ -300,7 +321,7 @@ static void njSwizzle(Class cls, SEL sel, IMP rep) {
     NSString *key = [NSString stringWithFormat:@"%p:%s", cls, sel_getName(sel)];
     if ([gDone containsObject:key]) return;
     [gDone addObject:key];
-    gOrigIMPs[key] = [NSValue valueWithPointer:method_getImplementation(m)];
+    gOrigIMPs[key] = [NSValue valueWithPointer:(void *)method_getImplementation(m)];
     method_setImplementation(m, rep);
     njLog(@"swizzled -[%s %s] %s", class_getName(cls), sel_getName(sel),
           method_getTypeEncoding(m));
@@ -308,7 +329,7 @@ static void njSwizzle(Class cls, SEL sel, IMP rep) {
 
 static IMP njOrigIMP(id self, SEL sel) {
     NSString *key = [NSString stringWithFormat:@"%p:%s", object_getClass(self), sel_getName(sel)];
-    return [gOrigIMPs[key] pointerValue];
+    return (IMP)[gOrigIMPs[key] pointerValue];
 }
 
 static BOOL njIsVC(Class cls) {
@@ -325,7 +346,8 @@ static BOOL njIsGateClass(Class cls) {
 static void njScanClasses(void) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
-    Class *list = calloc((size_t)n, sizeof(Class));
+    __unsafe_unretained Class *list =
+        (__unsafe_unretained Class *)calloc((size_t)n, sizeof(Class));
     if (!list) return;
     n = objc_getClassList(list, n);
 
@@ -372,11 +394,6 @@ static void njScanClasses(void) {
     free(list);
 }
 
-// declared before use
-static void njGateWillAppear(id self, SEL sel, BOOL animated);
-static void njGateDidAppear(id self, SEL sel, BOOL animated);
-static void njTryLeaveGate(UIViewController *vc, int attempt);
-
 static void njGateWillAppear(id self, SEL sel, BOOL animated) {
     njForce();
     IMP o = njOrigIMP(self, sel);
@@ -389,7 +406,8 @@ static void njGateDidAppear(id self, SEL sel, BOOL animated) {
     if (o) ((void (*)(id, SEL, BOOL))o)(self, sel, animated);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        njTryLeaveGate((__bridge UIViewController *)self, 0);
+        UIViewController *gate = self;
+        njTryLeaveGate(gate, 0);
     });
 }
 
@@ -418,7 +436,8 @@ static void njTryLeaveGate(UIViewController *vc, int attempt) {
 
         UIWindow *win = vc.view.window;
         if (win && win.rootViewController == vc) {
-            for (UIViewController *c in vc.children) {
+            NSArray *kids = (NSArray *)[vc valueForKey:@"children"];
+            for (UIViewController *c in kids) {
                 if (!njIsGateClass(object_getClass(c))) {
                     win.rootViewController = c;
                     njLog(@"promoted child %@ to root", NSStringFromClass(object_getClass(c)));
@@ -459,9 +478,10 @@ static void njPatchImage(const struct mach_header *mh, const char *path) {
 
     njLog(@"framework at %p (%s)", mh, path);
 
+    // __DATA first: it is writable and holds the mutable globals.
     struct { const char *seg; size_t hint; } cands[] = {
-        { "__DATA", 0x110 }, { "__DATA_CONST", 0x110 },
-        { "__DATA_DIRTY", 0x110 }, { "__AUTH", 0x110 }, { "__AUTH_CONST", 0x110 },
+        { "__DATA", 0x110 }, { "__DATA_DIRTY", 0x110 }, { "__DATA_CONST", 0x110 },
+        { "__AUTH", 0x110 }, { "__AUTH_CONST", 0x110 },
     };
 
     uint8_t *found = NULL;
@@ -471,7 +491,8 @@ static void njPatchImage(const struct mach_header *mh, const char *path) {
         if (!seg) continue;
         njMakeWritable(seg, sz);
         found = njFindState(seg, sz, cands[i].hint);
-        if (found) njLog(@"state in %s", cands[i].seg);
+        if (found) njLog(@"state in %s at +0x%zx", cands[i].seg,
+                         (size_t)(found - seg));
     }
 
     if (!found) { njLog(@"state not found - offsets likely wrong for this build"); return; }
@@ -492,8 +513,12 @@ static void njPatchImage(const struct mach_header *mh, const char *path) {
 
 static void njImageAdded(const struct mach_header *mh, intptr_t slide) {
     const char *path = njImagePathForHeader(mh);
-    if (path && strstr(path, "NinjaGate.framework/NinjaGate"))
-        njPatchImage(mh, path);
+    if (!path || !strstr(path, "NinjaGate.framework/NinjaGate")) return;
+    NSString *p = [NSString stringWithUTF8String:path];
+    // Deferred: njMSHookFunction dlopens, which can wedge the dyld lock.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        njPatchImage(mh, p.UTF8String);
+    });
 }
 
 __attribute__((constructor)) static void njInit(void) {
