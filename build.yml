@@ -1,0 +1,42 @@
+name: Build NinjaBypass
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          curl -L https://github.com/theos/sdks/archive/master.tar.gz -o /tmp/sdks.tar.gz
+          mkdir -p $THEOS/sdks
+          tar -xzf /tmp/sdks.tar.gz -C /tmp
+          mv /tmp/sdks-master/iPhoneOS16.5.sdk $THEOS/sdks/ 2>/dev/null || true
+          ls $THEOS/sdks
+
+      - name: Build
+        run: |
+          make clean || true
+          make package FINALPACKAGE=1
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find .theos -name "*.dylib" -exec cp {} out/ \;
+          find . -maxdepth 2 -name "*.deb" -exec cp {} out/ \;
+          ls -la out
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: NinjaBypass-dylib
+          path: out/
+          if-no-files-found: error

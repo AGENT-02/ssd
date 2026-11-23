@@ -1,0 +1,9 @@
+Package: com.cleus.ninjabypass
+Name: NinjaBypass
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: License bypass for 8 Ball pool (com.ninja.engine.ios) 56.34.0
+Maintainer: cleus
+Author: cleus
+Section: Tweaks
+Depends: mobilesubstrate
